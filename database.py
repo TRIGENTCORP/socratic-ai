@@ -3,12 +3,14 @@ SQLite database layer for the Socratic AI study platform.
 All operations use context managers to ensure connections are properly closed.
 """
 
+import os
 import sqlite3
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
 DB_PATH = "data/study.db"
+os.makedirs("data", exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
