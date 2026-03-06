@@ -1,16 +1,23 @@
 """
-SQLite database layer for the Socratic AI study platform.
+PostgreSQL database layer for the Socratic AI study platform.
 All operations use context managers to ensure connections are properly closed.
+Connection string is read from st.secrets["DATABASE_URL"] with fallback to
+the DATABASE_URL environment variable.
 """
 
 import os
-import sqlite3
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-DB_PATH = "data/study.db"
-os.makedirs("data", exist_ok=True)
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+try:
+    import streamlit as st
+    _DATABASE_URL = st.secrets["DATABASE_URL"]
+except Exception:
+    _DATABASE_URL = os.environ["DATABASE_URL"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,13 +26,11 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def get_connection():
     """Context manager that yields a database connection and handles cleanup."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # rows accessible by column name
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = psycopg2.connect(_DATABASE_URL, cursor_factory=RealDictCursor)
     try:
         yield conn
         conn.commit()
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         conn.rollback()
         logger.error("Database error: %s", e)
         raise
@@ -40,55 +45,59 @@ def get_connection():
 def init_db():
     """Create all tables if they do not already exist."""
     with get_connection() as conn:
-        conn.executescript("""
+        cur = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS students (
-                student_id       TEXT PRIMARY KEY,
+                student_id        TEXT PRIMARY KEY,
                 system_assignment TEXT NOT NULL CHECK(system_assignment IN ('A', 'B')),
-                enrollment_date  TEXT NOT NULL,
-                year_of_study    TEXT,
-                programme        TEXT
-            );
-
+                enrollment_date   TEXT NOT NULL,
+                year_of_study     TEXT,
+                programme         TEXT
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS posts (
-                post_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                student_id   TEXT NOT NULL REFERENCES students(student_id),
-                week_number  INTEGER NOT NULL,
-                topic        TEXT NOT NULL,
-                post_text    TEXT NOT NULL,
-                word_count   INTEGER NOT NULL,
-                timestamp    TEXT NOT NULL
-            );
-
+                post_id     SERIAL PRIMARY KEY,
+                student_id  TEXT NOT NULL REFERENCES students(student_id),
+                week_number INTEGER NOT NULL,
+                topic       TEXT NOT NULL,
+                post_text   TEXT NOT NULL,
+                word_count  INTEGER NOT NULL,
+                timestamp   TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS ai_responses (
-                response_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                post_id          INTEGER NOT NULL REFERENCES posts(post_id),
+                response_id       SERIAL PRIMARY KEY,
+                post_id           INTEGER NOT NULL REFERENCES posts(post_id),
                 ai_questions_text TEXT NOT NULL,
-                timestamp        TEXT NOT NULL
-            );
-
+                timestamp         TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS replies (
-                reply_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                reply_id    SERIAL PRIMARY KEY,
                 response_id INTEGER NOT NULL REFERENCES ai_responses(response_id),
                 student_id  TEXT NOT NULL REFERENCES students(student_id),
                 reply_text  TEXT NOT NULL,
                 word_count  INTEGER NOT NULL,
                 timestamp   TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ct_scores (
-                score_id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                reply_id            INTEGER NOT NULL REFERENCES replies(reply_id),
-                clarity_score       INTEGER NOT NULL,
-                depth_score         INTEGER NOT NULL,
-                evidence_score      INTEGER NOT NULL,
-                perspectives_score  INTEGER NOT NULL,
-                implications_score  INTEGER NOT NULL,
-                total_score         INTEGER NOT NULL,
-                timestamp           TEXT NOT NULL
-            );
-
+            )
         """)
-    logger.info("Database initialised at '%s'.", DB_PATH)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ct_scores (
+                score_id           SERIAL PRIMARY KEY,
+                reply_id           INTEGER NOT NULL REFERENCES replies(reply_id),
+                clarity_score      INTEGER NOT NULL,
+                depth_score        INTEGER NOT NULL,
+                evidence_score     INTEGER NOT NULL,
+                perspectives_score INTEGER NOT NULL,
+                implications_score INTEGER NOT NULL,
+                total_score        INTEGER NOT NULL,
+                timestamp          TEXT NOT NULL
+            )
+        """)
+    logger.info("Database initialised.")
 
 
 # ---------------------------------------------------------------------------
@@ -113,14 +122,15 @@ def add_student(student_id: str, system: str, date: str,
         programme:     Optional degree programme name.
 
     Raises:
-        sqlite3.IntegrityError: If student_id already exists or system is invalid.
+        psycopg2.IntegrityError: If student_id already exists or system is invalid.
     """
     with get_connection() as conn:
-        conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO students (student_id, system_assignment, enrollment_date,
                                   year_of_study, programme)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
             """,
             (student_id, system, date, year_of_study, programme),
         )
@@ -142,15 +152,17 @@ def add_post(student_id: str, week: int, topic: str, text: str) -> int:
     """
     word_count = len(text.split())
     with get_connection() as conn:
-        cursor = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO posts (student_id, week_number, topic, post_text,
                                word_count, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING post_id
             """,
             (student_id, week, topic, text, word_count, _now()),
         )
-        post_id = cursor.lastrowid
+        post_id = cur.fetchone()["post_id"]
     logger.info("Added post %d for student '%s' (week %d).", post_id, student_id, week)
     return post_id
 
@@ -167,14 +179,16 @@ def add_ai_response(post_id: int, questions: str) -> int:
         The auto-assigned response_id for the new record.
     """
     with get_connection() as conn:
-        cursor = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO ai_responses (post_id, ai_questions_text, timestamp)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
+            RETURNING response_id
             """,
             (post_id, questions, _now()),
         )
-        response_id = cursor.lastrowid
+        response_id = cur.fetchone()["response_id"]
     logger.info("Added AI response %d for post %d.", response_id, post_id)
     return response_id
 
@@ -193,15 +207,17 @@ def add_reply(response_id: int, student_id: str, text: str) -> int:
     """
     word_count = len(text.split())
     with get_connection() as conn:
-        cursor = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO replies (response_id, student_id, reply_text,
                                  word_count, timestamp)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING reply_id
             """,
             (response_id, student_id, text, word_count, _now()),
         )
-        reply_id = cursor.lastrowid
+        reply_id = cur.fetchone()["reply_id"]
     logger.info("Added reply %d for response %d.", reply_id, response_id)
     return reply_id
 
@@ -234,12 +250,14 @@ def save_scores(reply_id: int, scores_dict: dict) -> int:
     total = sum(scores_dict[k] for k in required)
 
     with get_connection() as conn:
-        cursor = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             INSERT INTO ct_scores (reply_id, clarity_score, depth_score,
                                    evidence_score, perspectives_score,
                                    implications_score, total_score, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING score_id
             """,
             (
                 reply_id,
@@ -252,7 +270,7 @@ def save_scores(reply_id: int, scores_dict: dict) -> int:
                 _now(),
             ),
         )
-        score_id = cursor.lastrowid
+        score_id = cur.fetchone()["score_id"]
     logger.info("Saved scores (id %d) for reply %d. Total: %d.", score_id, reply_id, total)
     return score_id
 
@@ -272,9 +290,11 @@ def get_student(student_id: str) -> dict | None:
         A dict with student fields, or None if not found.
     """
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM students WHERE student_id = ?", (student_id,)
-        ).fetchone()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM students WHERE student_id = %s", (student_id,)
+        )
+        row = cur.fetchone()
     return dict(row) if row else None
 
 
@@ -297,7 +317,8 @@ def get_conversation(student_id: str, week: int) -> list[dict]:
             scores      – ct_scores record (or None)
     """
     with get_connection() as conn:
-        rows = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             SELECT
                 p.post_id, p.week_number, p.topic, p.post_text,
@@ -318,11 +339,12 @@ def get_conversation(student_id: str, week: int) -> list[dict]:
             LEFT JOIN ai_responses ar ON ar.post_id = p.post_id
             LEFT JOIN replies r       ON r.response_id = ar.response_id
             LEFT JOIN ct_scores ct    ON ct.reply_id = r.reply_id
-            WHERE p.student_id = ? AND p.week_number = ?
+            WHERE p.student_id = %s AND p.week_number = %s
             ORDER BY p.post_id
             """,
             (student_id, week),
-        ).fetchall()
+        )
+        rows = cur.fetchall()
 
     return [dict(row) for row in rows]
 
@@ -334,10 +356,12 @@ def get_post_for_week(student_id: str, week: int) -> dict | None:
     Used to prevent duplicate submissions and guard the submit form.
     """
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM posts WHERE student_id = ? AND week_number = ? LIMIT 1",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM posts WHERE student_id = %s AND week_number = %s LIMIT 1",
             (student_id, week),
-        ).fetchone()
+        )
+        row = cur.fetchone()
     return dict(row) if row else None
 
 
@@ -353,16 +377,18 @@ def get_recent_posts(week: int, limit: int = 10) -> list[dict]:
         A list of post dicts ordered by timestamp descending.
     """
     with get_connection() as conn:
-        rows = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             """
             SELECT p.*, s.system_assignment, s.programme
             FROM posts p
             JOIN students s ON s.student_id = p.student_id
-            WHERE p.week_number = ?
+            WHERE p.week_number = %s
             ORDER BY p.timestamp DESC
-            LIMIT ?
+            LIMIT %s
             """,
             (week, limit),
-        ).fetchall()
+        )
+        rows = cur.fetchall()
 
     return [dict(row) for row in rows]
