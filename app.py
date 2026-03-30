@@ -47,28 +47,40 @@ def _calculate_week(enrollment_date_str: str) -> int:
     return max(1, min(4, weeks_elapsed))
 
 
-def _do_login(student_id: str) -> None:
+def _do_login(student_id: str, silent: bool = False) -> None:
     """Validate the student ID and populate session state."""
     if not student_id.strip():
-        st.error("Please enter a student ID.")
+        if not silent:
+            st.error("Please enter a student ID.")
         return
 
     student = database.get_student(student_id.strip())
     if student is None:
-        st.error(f"Student ID '{student_id}' not found. Please check your ID or contact your administrator.")
+        if not silent:
+            st.error(f"Student ID '{student_id}' not found. Please check your ID or contact your administrator.")
         return
 
     st.session_state.logged_in = True
     st.session_state.student_id = student["student_id"]
     st.session_state.system_type = student["system_assignment"]
     st.session_state.current_week = _calculate_week(student["enrollment_date"])
+    st.query_params["sid"] = student["student_id"]
 
 
 def _do_logout() -> None:
     """Clear all session state and return to the login screen."""
     for key in defaults:
         st.session_state[key] = defaults[key]
+    st.query_params.clear()
     st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Auto-login from query params (persists session across refresh)
+# ---------------------------------------------------------------------------
+
+if not st.session_state.logged_in and "sid" in st.query_params:
+    _do_login(st.query_params["sid"], silent=True)
 
 
 # ---------------------------------------------------------------------------

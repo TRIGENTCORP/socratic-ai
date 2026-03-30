@@ -230,6 +230,7 @@ with st.sidebar:
     if st.button("Log out", use_container_width=True):
         for key in ("logged_in", "student_id", "system_type", "current_week"):
             st.session_state[key] = None if key != "logged_in" else False
+        st.query_params.clear()
         st.switch_page("app.py")
 
 # ---------------------------------------------------------------------------
